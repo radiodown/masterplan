@@ -1,6 +1,7 @@
 import {
-  addMonths, daysBetween, CONTRACT_PAYMENTS, CLOSING_PAYMENTS, DIRECT_PAYMENTS,
-  MOVE_IN, PURCHASE_PRICE, SNAPSHOT_DATES, TRANCHES,
+  addMonths, daysBetween, CONTRACT_PAYMENTS, CLOSING_PAYMENTS, DEFAULT_REPAYMENT, DIRECT_PAYMENTS,
+  INTERIM_PRINCIPAL, LAST_PREPAYMENT_DATE, MAX_MORTGAGE_RATE, MAX_MORTGAGE_YEARS, MOVE_IN,
+  PRIVATE_LOAN_MONTHS, PURCHASE_PRICE, SNAPSHOT_DATES, TRANCHES,
 } from './project.js';
 
 const sum = (items, amount) => items.reduce((total, item) => total + amount(item), 0);
@@ -26,7 +27,7 @@ function isId(value) {
 
 export function validatePlan(plan) {
   check(plan && isDate(plan.asOf) && plan.asOf <= MOVE_IN, '자산 기준일을 확인해 주세요.');
-  const { asOf, assets, savings, prepayments, paidIds, rates } = plan;
+  const { asOf, assets, savings, prepayments, prepaymentSlider = 0, paidIds, rates, repayment = DEFAULT_REPAYMENT } = plan;
   check(Array.isArray(assets) && assets.length <= 100, '보유자산은 최대 100개까지 입력할 수 있습니다.');
   check(assets.every((asset) => asset && isId(asset.id) && typeof asset.name === 'string'
     && asset.name.trim().length > 0 && asset.name.length <= 50 && isAmount(asset.amount)), '자산 이름과 금액을 확인해 주세요.');
@@ -39,10 +40,19 @@ export function validatePlan(plan) {
     && (payment.target === 'auto' || TRANCHES.some(({ id }) => id === payment.target))),
   '조기상환 금액, 날짜 및 대상 회차를 확인해 주세요.');
   check(new Set(prepayments.map(({ id }) => id)).size === prepayments.length, '상환 식별자가 중복되었습니다.');
+  check(isAmount(prepaymentSlider, 0) && prepaymentSlider <= INTERIM_PRINCIPAL, '슬라이더의 중도금 상환액을 확인해 주세요.');
   check(Array.isArray(paidIds) && paidIds.every((id) => DIRECT_PAYMENTS.some((item) => item.id === id)),
     '납부 상태를 확인해 주세요.');
   check(rates && [rates.initialCofix, rates.renewalCofix, rates.spread].every((rate) =>
     Number.isFinite(rate) && rate >= 0 && rate <= 30), 'COFIX와 가산금리는 0~30% 범위로 입력해 주세요.');
+  check(repayment && Number.isFinite(repayment.annualRate) && repayment.annualRate >= 0 && repayment.annualRate <= MAX_MORTGAGE_RATE,
+    `잔금대출 금리는 0~${MAX_MORTGAGE_RATE}% 범위로 입력해 주세요.`);
+  check(Number.isInteger(repayment.years) && repayment.years >= 1 && repayment.years <= MAX_MORTGAGE_YEARS,
+    `잔금대출 기간은 1~${MAX_MORTGAGE_YEARS}년 범위로 입력해 주세요.`);
+  check(isAmount(repayment.privateAmount, 0), '지인 차입액을 만원 단위의 정수로 입력해 주세요.');
+  const { firstExtra = 0, laterExtra = 0 } = repayment;
+  check(isAmount(firstExtra, 0) && isAmount(laterExtra, 0),
+    '잔금대출 추가 납부액은 만원 단위의 정수로 입력해 주세요.');
 }
 
 function simulateLoans(rates, prepayments) {
@@ -120,52 +130,115 @@ function simulateCash(plan) {
   }
   const unpaid = CONTRACT_PAYMENTS.filter(({ id }) => !plan.paidIds.includes(id));
   const payments = unpaid.map(({ date, amount }) => ({ date: date < plan.asOf ? plan.asOf : date, amount: -amount }));
-  const plannedPrepayments = plan.prepayments.filter(({ date }) => date >= plan.asOf);
-  payments.push(...plannedPrepayments.map(({ date, amount }) => ({ date, amount: -amount })));
-
   let balance = assets;
   let earlyFunding = 0;
   let firstShortfall = null;
-  const ledger = [...deposits, ...payments].sort((a, b) => a.date.localeCompare(b.date) || b.amount - a.amount);
+  // Same-day savings are available for required contract payments.
+  const ledger = [...deposits, ...payments].sort((a, b) => a.date.localeCompare(b.date));
   for (const { date, amount } of ledger) {
     balance += amount;
-    if (balance < 0) {
+    const shortfall = Math.max(0, -balance);
+    if (shortfall > 0) {
       firstShortfall ??= date;
-      earlyFunding -= balance;
+      earlyFunding += shortfall;
       balance = 0;
     }
   }
   return {
     assets, savingsCount, firstShortfall, earlyFunding,
     savings: savingsCount * plan.savings.amount,
-    pastPrepayments: sum(plan.prepayments, ({ date, amount }) => date < plan.asOf ? amount : 0),
-    cashAtClosing: balance,
+    cashAtClosing: balance, contractCash: sum(unpaid, ({ amount }) => amount) - earlyFunding,
+  };
+}
+
+function makeSliderPlan(plan, existingLoans) {
+  const limit = plan.asOf <= LAST_PREPAYMENT_DATE ? existingLoans.principal : 0;
+  const amount = Math.min(plan.prepaymentSlider ?? 0, limit);
+  // Slider payments follow any legacy automatic allocations on the same day.
+  const availableFrom = [plan.asOf, ...plan.prepayments.filter(({ target }) => target === 'auto').map(({ date }) => date)].sort().at(-1);
+  const payments = [];
+  let remaining = amount;
+  let through = 0;
+  const tranches = existingLoans.loans.map(({ id, title, date, balance }) => {
+    through += balance;
+    const paymentAmount = Math.min(remaining, balance);
+    if (paymentAmount > 0) {
+      payments.push({ id: `slider:${id}`, target: id, title, date: date > availableFrom ? date : availableFrom, amount: paymentAmount });
+      remaining -= paymentAmount;
+    }
+    return { id, title, date, balance, through };
+  });
+  return { limit, amount, payments, tranches };
+}
+
+function calculateRepayment(closingGap, { annualRate, years, privateAmount, firstExtra = 0, laterExtra = 0 }) {
+  const privateForClosing = Math.min(privateAmount, closingGap);
+  const mortgage = closingGap - privateForClosing;
+  const mortgageMonths = years * 12;
+  const monthlyRate = annualRate / 1200;
+  const principalWon = mortgage * 10_000;
+  const monthLog = Math.log1p(monthlyRate);
+  const discount = -Math.expm1(-mortgageMonths * monthLog);
+  const regularPayment = principalWon * (monthlyRate === 0 ? 1 / mortgageMonths : monthlyRate / discount);
+  const mortgageMonthly = Math.round(regularPayment);
+  const privateMonthly = Math.round(privateAmount * 10_000 / PRIVATE_LOAN_MONTHS);
+  let balance = principalWon;
+  let extraReduction = 0;
+  let actualMonths = 0;
+  let firstBankMonthly = 0;
+  let laterBankMonthly = 0;
+
+  for (let month = 1; month <= mortgageMonths && balance > 0.000001; month++) {
+    const extra = (month <= PRIVATE_LOAN_MONTHS ? firstExtra : laterExtra) * 10_000;
+    const due = balance * (1 + monthlyRate);
+    const payment = Math.min(due, regularPayment + extra);
+    actualMonths = month;
+    if (month === 1) firstBankMonthly = Math.round(payment);
+    if (month === PRIVATE_LOAN_MONTHS + 1) laterBankMonthly = Math.round(payment);
+    if (payment >= due) break;
+
+    // The scheduled balance minus accumulated extra principal avoids drift over long terms.
+    const monthsLeft = mortgageMonths - month;
+    const scheduledBalanceRatio = monthlyRate === 0 ? monthsLeft / mortgageMonths : -Math.expm1(-monthsLeft * monthLog) / discount;
+    extraReduction = extraReduction * (1 + monthlyRate) + extra;
+    balance = principalWon * scheduledBalanceRatio - extraReduction;
+  }
+
+  return {
+    mortgage, privateForClosing, mortgageMonths, mortgageMonthly, privateMonthly, actualMonths,
+    firstBankMonthly, laterBankMonthly, monthlyTotal: firstBankMonthly + privateMonthly,
   };
 }
 
 export function calculatePlan(plan) {
   validatePlan(plan);
   const baseline = simulateLoans(plan.rates, []);
-  const loan = plan.prepayments.length ? simulateLoans(plan.rates, plan.prepayments) : baseline;
+  const existing = plan.prepayments.length ? simulateLoans(plan.rates, plan.prepayments) : baseline;
+  const slider = makeSliderPlan(plan, existing);
+  const loan = slider.amount > 0 ? simulateLoans(plan.rates, [...plan.prepayments, ...slider.payments]) : existing;
   const cash = simulateCash(plan);
   const closingFixed = sum(CLOSING_PAYMENTS.filter(({ id }) => !plan.paidIds.includes(id)), ({ amount }) => amount);
   const closing = closingFixed + loan.interest;
   const settlement = closing + loan.principal;
-  const mortgage = Math.max(0, settlement - cash.cashAtClosing);
+  const closingGap = Math.max(0, settlement - cash.cashAtClosing);
+  const { mortgage, ...repayment } = calculateRepayment(closingGap, plan.repayment ?? DEFAULT_REPAYMENT);
   const appliedCash = Math.min(cash.cashAtClosing, settlement);
   const paid = DIRECT_PAYMENTS.filter(({ id }) => plan.paidIds.includes(id));
   const options = sum(DIRECT_PAYMENTS.filter(({ category }) => category === 'option'), ({ amount }) => amount);
+  const extension = sum(DIRECT_PAYMENTS.filter(({ id }) => id === 'extension' || id === 'extension-deposit'), ({ amount }) => amount);
   const tax = CLOSING_PAYMENTS.find(({ id }) => id === 'tax').amount;
   const extraExpense = options + tax + loan.interest;
   const totalExpense = PURCHASE_PRICE + extraExpense;
   const paidAmount = sum(paid, ({ amount }) => amount);
-  const totalAdditionalFunding = mortgage + cash.earlyFunding;
-  const funded = paidAmount + cash.pastPrepayments;
-  const plannedFunds = Math.max(0, totalExpense - funded - totalAdditionalFunding);
+  const totalAdditionalFunding = closingGap + cash.earlyFunding;
+  const prepaymentTotal = baseline.principal - loan.principal;
+  const funded = paidAmount + prepaymentTotal;
+  const plannedFunds = cash.contractCash + appliedCash;
+  const assetsUsed = Math.min(cash.assets, plannedFunds);
 
   return {
-    ...cash, ...loan, closing, settlement, mortgage, appliedCash, options, tax, extraExpense,
-    totalExpense, paidAmount, totalAdditionalFunding, funded, plannedFunds,
+    ...cash, ...loan, closing, settlement, closingGap, mortgage, repayment, slider, appliedCash, options, extension, tax, extraExpense,
+    totalExpense, paidAmount, prepaymentTotal, totalAdditionalFunding, funded, plannedFunds, assetsUsed, savingsUsed: plannedFunds - assetsUsed,
     paidPurchase: sum(paid.filter(({ category }) => category === 'purchase'), ({ amount }) => amount),
     paidOptions: sum(paid.filter(({ category }) => category === 'option'), ({ amount }) => amount),
     baselineInterest: baseline.interest,

@@ -1,9 +1,16 @@
+const DAY = 86_400_000;
+
 export const MOVE_IN = '2028-12-07';
+export const LAST_PREPAYMENT_DATE = new Date(Date.parse(MOVE_IN) - DAY).toISOString().slice(0, 10);
 export const PURCHASE_PRICE = 62_950;
 export const REFERENCE_TOTAL = 65_646;
 export const REFERENCE_CLOSING = 28_087;
 export const REFERENCE_INTEREST = 2_833;
 export const REFERENCE_BALANCE = 22_032;
+export const PRIVATE_LOAN_MONTHS = 60;
+export const MAX_MORTGAGE_RATE = 30;
+export const MAX_MORTGAGE_YEARS = 99;
+export const DEFAULT_REPAYMENT = Object.freeze({ annualRate: 4, years: 30, privateAmount: 0, firstExtra: 0, laterExtra: 0 });
 
 export const CONTRACT_PAYMENTS = [
   { id: 'reservation', date: '2026-08-15', title: '가계약금', amount: 1000, category: 'purchase' },
@@ -44,8 +51,6 @@ export const SNAPSHOT_DATES = [
   '2028-03-07', '2028-05-07', '2028-06-07', '2028-09-07', '2028-11-07', MOVE_IN,
 ];
 
-const DAY = 86_400_000;
-
 export function daysBetween(from, to) {
   return (Date.parse(to) - Date.parse(from)) / DAY;
 }
@@ -67,7 +72,9 @@ export function makeDefaultPlan(today = seoulToday()) {
     assets: [],
     savings: { amount: 0, firstDate: addMonths(`${asOf.slice(0, 7)}-25`, 1) },
     prepayments: [],
+    prepaymentSlider: 0,
     paidIds: DIRECT_PAYMENTS.filter(({ date }) => date < asOf).map(({ id }) => id),
     rates: { initialCofix: 3.62, renewalCofix: 3.87, spread: 1.55 },
+    repayment: { ...DEFAULT_REPAYMENT },
   };
 }

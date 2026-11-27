@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Building2, CalendarDays, ChartNoAxesCombined, CircleCheck, Cloud, CloudOff, LayoutDashboard } from 'lucide-react';
+import { Building2, CalendarDays, ChartNoAxesCombined, CircleCheck, Cloud, CloudOff, Landmark, LayoutDashboard } from 'lucide-react';
 import { calculatePlan } from '../shared/calculate.js';
-import { MOVE_IN, TRANCHES } from '../shared/project.js';
+import { LAST_PREPAYMENT_DATE, TRANCHES } from '../shared/project.js';
 import { Overview } from './Overview.jsx';
 import { Interest, Schedule } from './Details.jsx';
+import { Repayment } from './Repayment.jsx';
 import { Dialog, Money, SelectField, UnitField, longDate } from './ui.jsx';
 import './styles.css';
 
@@ -12,6 +13,7 @@ const pages = {
   overview: { label: '개요', icon: LayoutDashboard },
   schedule: { label: '납부 일정', icon: CalendarDays },
   interest: { label: '중도금 이자', icon: ChartNoAxesCombined },
+  repayment: { label: '대출 상환', icon: Landmark },
 };
 
 function getPage() {
@@ -54,7 +56,46 @@ function replaceItem(items, item) {
   return items.some(({ id }) => id === item.id) ? items.map((old) => old.id === item.id ? item : old) : [...items, item];
 }
 
-function PlanDialog({ modal, plan, commit, onClose }) {
+function PrepaymentDialog({ modal, summary, commit, onClose }) {
+  const { item } = modal;
+  const [target, setTarget] = useState(item.target);
+  const loan = summary.slider.tranches.find(({ id }) => id === target);
+  const firstDate = loan?.date ?? TRANCHES[0].date;
+  const [date, setDate] = useState(item.date);
+  const [amount, setAmount] = useState(item.amount);
+  const previousAllocations = summary.allocations[item.id];
+  const capacity = (candidate) => candidate.balance + (previousAllocations.find(({ id }) => id === candidate.id)?.amount ?? 0);
+  const available = loan ? capacity(loan) : summary.principal + summary.slider.amount + item.amount;
+
+  function changeTarget(event) {
+    const nextTarget = event.target.value;
+    const nextFirstDate = summary.slider.tranches.find(({ id }) => id === nextTarget)?.date ?? TRANCHES[0].date;
+    setTarget(nextTarget);
+    if (date && date < nextFirstDate) setDate(nextFirstDate);
+  }
+
+  return <Dialog title={loan ? `${loan.title} 조기상환 수정` : '조기상환 수정'}
+    description={loan ? `대출 실행일 ${longDate(loan.date)}` : '기존 금리 순서에 따라 회차별로 배분합니다.'} onClose={onClose}
+    onSubmit={(form) => commit((current) => ({ ...current, prepayments: replaceItem(current.prepayments, {
+      id: item.id, date: form.get('date'), amount: Number(form.get('amount')), target,
+    }) }))}>
+    <SelectField label="상환 회차" value={target} onChange={changeTarget}>
+      {item.target === 'auto' && <option value="auto">기존 자동 배분</option>}
+      {summary.slider.tranches.map((candidate) => <option value={candidate.id} key={candidate.id} disabled={capacity(candidate) === 0}>{candidate.title}</option>)}
+    </SelectField>
+    <label className="field"><span>상환일</span><input name="date" type="date" min={firstDate} max={LAST_PREPAYMENT_DATE} required autoFocus
+      value={date} onChange={(event) => setDate(event.target.value)} /></label>
+    <UnitField label="상환 원금" name="amount" min="1" max={available} step="1" placeholder="0" value={amount}
+      onChange={(event) => setAmount(event.target.value)} required />
+    {loan && <div className="repayment-limit">
+      <span>상환 가능 원금 <Money value={available} /></span>
+      <button className="button subtle" type="button" onClick={() => setAmount(available)}>전액 입력</button>
+    </div>}
+    <p className="card-note">자산 기준일 이전의 상환은 이미 반영된 금액으로 처리합니다.</p>
+  </Dialog>;
+}
+
+function PlanDialog({ modal, plan, summary, commit, onClose }) {
   const { item, kind } = modal;
   if (kind === 'asset') return <Dialog title={item ? '자산 수정' : '자산 추가'} onClose={onClose}
     description={`${longDate(plan.asOf)} 기준으로 입주에 사용할 금액을 입력하세요.`}
@@ -65,20 +106,7 @@ function PlanDialog({ modal, plan, commit, onClose }) {
     <UnitField label="자산 금액" name="amount" min="1" step="1" placeholder="0" defaultValue={item?.amount} required />
   </Dialog>;
 
-  if (kind === 'prepayment') return <Dialog title={item ? '조기상환 수정' : '조기상환 추가'} onClose={onClose}
-    description="상환일부터 해당 원금에 대한 이자가 줄어듭니다."
-    onSubmit={(form) => commit((current) => ({ ...current, prepayments: replaceItem(current.prepayments, {
-      id: item?.id ?? crypto.randomUUID(), date: form.get('date'), amount: Number(form.get('amount')), target: form.get('target'),
-    }) }))}>
-    <label className="field"><span>상환일</span><input name="date" type="date" min={TRANCHES[0].date} max="2028-12-06" required autoFocus
-      defaultValue={item?.date ?? (plan.asOf >= MOVE_IN ? '2028-12-06' : [plan.asOf, TRANCHES[0].date].sort().at(-1))} /></label>
-    <UnitField label="상환 원금" name="amount" min="1" step="1" placeholder="0" defaultValue={item?.amount} required />
-    <SelectField label="상환 회차" name="target" defaultValue={item?.target ?? 'auto'}>
-      <option value="auto">금리가 높은 회차부터</option>
-      {TRANCHES.map(({ id, title }) => <option value={id} key={id}>{title}</option>)}
-    </SelectField>
-    <p className="card-note">자산 기준일 이전의 상환은 이미 반영된 금액으로 처리합니다.</p>
-  </Dialog>;
+  if (kind === 'prepayment') return <PrepaymentDialog {...{ modal, summary, commit, onClose }} />;
 
   if (kind === 'rate') return <Dialog title="금리 수정" description="COFIX 예상치와 가산금리를 입력하세요." onClose={onClose}
     onSubmit={(form) => commit((current) => ({ ...current, rates: {
@@ -161,16 +189,17 @@ function App() {
   return <>
     <Header {...{ page, saveState }} retrySave={() => save(latestPlan.current)} />
     <main className="main">
-      {loadError ? <div className="card load-state"><h1>계획을 불러오지 못했습니다</h1><p>{loadError}</p>
+      {loadError ? <div className="load-state"><h1>계획을 불러오지 못했습니다</h1><p>{loadError}</p>
         <button className="button primary" type="button" onClick={load}>다시 시도</button></div>
         : !model ? <div className="load-state" role="status">자금 계획을 불러오는 중입니다.</div>
           : <>
             {page === 'overview' && <Overview {...{ model, commit, editAsset, removeAsset, editPrepayment, removePrepayment }} />}
             {page === 'schedule' && <Schedule {...model} commit={commit} />}
             {page === 'interest' && <Interest {...{ model, editRates }} />}
+            {page === 'repayment' && <Repayment {...{ model, commit }} />}
           </>}
     </main>
-    {modal && <PlanDialog {...{ modal, commit }} plan={model.plan} onClose={() => setModal(null)} />}
+    {modal && <PlanDialog {...{ modal, commit }} {...model} onClose={() => setModal(null)} />}
   </>;
 }
 

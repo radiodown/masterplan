@@ -22,7 +22,7 @@ export function Schedule({ plan, summary, commit }) {
 
   return <>
     <div className="page-heading"><div><h1>납부 일정</h1><p>납부 상태를 누르면 완료 여부를 바꿀 수 있습니다.</p></div></div>
-    <section className="card ledger" aria-label="전체 납부 내역">
+    <section className="ledger" aria-label="전체 납부 내역">
       <p className="ledger-summary">
         <span>분양가 <Money value={PURCHASE_PRICE} /></span>
         <span>추가 비용 <Money value={summary.extraExpense} /></span>
@@ -64,7 +64,7 @@ export function Interest({ model, editRates }) {
     <div className="page-heading"><div><h1>중도금 이자</h1><p>건설사 선납 · 입주일 일괄 정산</p></div>
       <button className="button primary" type="button" onClick={editRates}><Settings2 size={18} /> 금리 수정</button>
     </div>
-    <section className="card ledger" aria-label="회차별 이자 산정 내역">
+    <section className="ledger" aria-label="회차별 이자 산정 내역">
       <p className="ledger-summary">
         <span>예상 이자 <Money value={summary.interest} detailed /></span>
         {summary.savedInterest > 0 && <>
